@@ -1,0 +1,471 @@
+prompt,completion
+"Write an Ante test for WETH to check if WETH is fully backed by ETH. This is the WETH9 contract used. 
+
+pragma solidity ^0.4.18;
+
+contract WETH9 {
+    string public name     = ""Wrapped Ether"";
+    string public symbol   = ""WETH"";
+    uint8  public decimals = 18;
+
+    event  Approval(address indexed src, address indexed guy, uint wad);
+    event  Transfer(address indexed src, address indexed dst, uint wad);
+    event  Deposit(address indexed dst, uint wad);
+    event  Withdrawal(address indexed src, uint wad);
+
+    mapping (address => uint)                       public  balanceOf;
+    mapping (address => mapping (address => uint))  public  allowance;
+
+    function() public payable {
+        deposit();
+    }
+    function deposit() public payable {
+        balanceOf[msg.sender] += msg.value;
+        Deposit(msg.sender, msg.value);
+    }
+    function withdraw(uint wad) public {
+        require(balanceOf[msg.sender] >= wad);
+        balanceOf[msg.sender] -= wad;
+        msg.sender.transfer(wad);
+        Withdrawal(msg.sender, wad);
+    }
+
+    function totalSupply() public view returns (uint) {
+        return this.balance;
+    }
+
+    function approve(address guy, uint wad) public returns (bool) {
+        allowance[msg.sender][guy] = wad;
+        Approval(msg.sender, guy, wad);
+        return true;
+    }
+
+    function transfer(address dst, uint wad) public returns (bool) {
+        return transferFrom(msg.sender, dst, wad);
+    }
+
+    function transferFrom(address src, address dst, uint wad)
+        public
+        returns (bool)
+    {
+        require(balanceOf[src] >= wad);
+
+        if (src != msg.sender && allowance[src][msg.sender] != uint(-1)) {
+            require(allowance[src][msg.sender] >= wad);
+            allowance[src][msg.sender] -= wad;
+        }
+
+        balanceOf[src] -= wad;
+        balanceOf[dst] += wad;
+
+        Transfer(src, dst, wad);
+
+        return true;
+    }
+}","pragma solidity ^0.7.0;
+
+import ""@openzeppelin/contracts/token/ERC20/IERC20.sol"";
+import ""../AnteTest.sol"";
+
+
+contract AnteWETH9Test is AnteTest(""Checks WETH9 issued WETH fully backed by ETH"") {
+    address public immutable wETH9Addr;
+
+    IERC20 public wETH9Token;
+
+    constructor(address _wETH9Addr) {
+        wETH9Addr = _wETH9Addr;
+        wETH9Token = IERC20(_wETH9Addr);
+
+        protocolName = ""WETH9"";
+        testedContracts = [_wETH9Addr];
+    }
+
+    function checkTestPasses() external view override returns (bool) {
+        return address(wETH9Token).balance == wETH9Token.totalSupply();
+    }
+}
+
+###
+"
+"Write an Ante test for LlamaPay to check if it never pays future payments early. This is the LlamaPay contract used.
+
+pragma solidity ^0.8.0;
+
+import {IERC20} from ""@openzeppelin/contracts/token/ERC20/IERC20.sol"";
+import {SafeERC20} from ""@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol"";
+import {BoringBatchable} from ""./fork/BoringBatchable.sol"";
+
+interface Factory {
+    function parameter() external view returns (address);
+}
+
+interface IERC20WithDecimals {
+    function decimals() external view returns (uint8);
+}
+
+
+contract LlamaPay is BoringBatchable {
+    using SafeERC20 for IERC20;
+
+    struct Payer {
+        uint40 lastPayerUpdate;
+        uint216 totalPaidPerSec;
+    }
+
+    mapping (bytes32 => uint) public streamToStart;
+    mapping (address => Payer) public payers;
+    mapping (address => uint) public balances;
+    IERC20 public token;
+    uint public DECIMALS_DIVISOR;
+
+    event StreamCreated(address indexed from, address indexed to, uint216 amountPerSec, bytes32 streamId);
+    event StreamCreatedWithReason(address indexed from, address indexed to, uint216 amountPerSec, bytes32 streamId, string reason);
+    event StreamCancelled(address indexed from, address indexed to, uint216 amountPerSec, bytes32 streamId);
+    event StreamPaused(address indexed from, address indexed to, uint216 amountPerSec, bytes32 streamId);
+    event StreamModified(address indexed from, address indexed oldTo, uint216 oldAmountPerSec, bytes32 oldStreamId, address indexed to, uint216 amountPerSec, bytes32 newStreamId);
+    event Withdraw(address indexed from, address indexed to, uint216 amountPerSec, bytes32 streamId, uint amount);
+    event PayerDeposit(address indexed from, uint amount);
+    event PayerWithdraw(address indexed from, uint amount);
+
+    constructor(){
+        token = IERC20(Factory(msg.sender).parameter());
+        uint8 tokenDecimals = IERC20WithDecimals(address(token)).decimals();
+        DECIMALS_DIVISOR = 10**(20 - tokenDecimals);
+    }
+
+    function getStreamId(address from, address to, uint216 amountPerSec) public pure returns (bytes32){
+        return keccak256(abi.encodePacked(from, to, amountPerSec));
+    }
+
+    function _createStream(address to, uint216 amountPerSec) internal returns (bytes32 streamId){
+        streamId = getStreamId(msg.sender, to, amountPerSec);
+        require(amountPerSec > 0, ""amountPerSec can't be 0"");
+        require(streamToStart[streamId] == 0, ""stream already exists"");
+        streamToStart[streamId] = block.timestamp;
+
+        Payer storage payer = payers[msg.sender];
+        uint totalPaid;
+        uint delta = block.timestamp - payer.lastPayerUpdate;
+        unchecked {
+            totalPaid = delta * uint(payer.totalPaidPerSec);
+        }
+        balances[msg.sender] -= totalPaid; // implicit check that balance >= totalPaid, can't create a new stream unless there's no debt
+
+        payer.lastPayerUpdate = uint40(block.timestamp);
+        payer.totalPaidPerSec += amountPerSec;
+    }
+
+    function createStream(address to, uint216 amountPerSec) public {
+        bytes32 streamId = _createStream(to, amountPerSec);
+        emit StreamCreated(msg.sender, to, amountPerSec, streamId);
+    }
+
+    function createStreamWithReason(address to, uint216 amountPerSec, string calldata reason) public {
+        bytes32 streamId = _createStream(to, amountPerSec);
+        emit StreamCreatedWithReason(msg.sender, to, amountPerSec, streamId, reason);
+    }
+
+
+    function _withdraw(address from, address to, uint216 amountPerSec) private returns (uint40 lastUpdate, bytes32 streamId, uint amountToTransfer) {
+        streamId = getStreamId(from, to, amountPerSec);
+        require(streamToStart[streamId] != 0, ""stream doesn't exist"");
+
+        Payer storage payer = payers[from];
+        uint totalPayerPayment;
+        uint payerDelta = block.timestamp - payer.lastPayerUpdate;
+        unchecked{
+            totalPayerPayment = payerDelta * uint(payer.totalPaidPerSec);
+        }
+        uint payerBalance = balances[from];
+        if(payerBalance >= totalPayerPayment){
+            unchecked {
+                balances[from] = payerBalance - totalPayerPayment;   
+            }
+            lastUpdate = uint40(block.timestamp);
+        } else {
+            unchecked {
+                uint timePaid = payerBalance/uint(payer.totalPaidPerSec);
+                lastUpdate = uint40(payer.lastPayerUpdate + timePaid);
+                balances[from] = payerBalance % uint(payer.totalPaidPerSec);
+            }
+        }
+        uint delta = lastUpdate - streamToStart[streamId]; // Could use unchecked here too I think
+        unchecked {
+            amountToTransfer = (delta*uint(amountPerSec))/DECIMALS_DIVISOR;
+        }
+        emit Withdraw(from, to, amountPerSec, streamId, amountToTransfer);
+    }
+
+    function withdrawable(address from, address to, uint216 amountPerSec) external view returns (uint withdrawableAmount, uint lastUpdate, uint owed) {
+        bytes32 streamId = getStreamId(from, to, amountPerSec);
+        require(streamToStart[streamId] != 0, ""stream doesn't exist"");
+
+        Payer storage payer = payers[from];
+        uint totalPayerPayment;
+        uint payerDelta = block.timestamp - payer.lastPayerUpdate;
+        unchecked{
+            totalPayerPayment = payerDelta * uint(payer.totalPaidPerSec);
+        }
+        uint payerBalance = balances[from];
+        if(payerBalance >= totalPayerPayment){
+            lastUpdate = block.timestamp;
+        } else {
+            unchecked {
+                uint timePaid = payerBalance/uint(payer.totalPaidPerSec);
+                lastUpdate = payer.lastPayerUpdate + timePaid;
+            }
+        }
+        uint delta = lastUpdate - streamToStart[streamId];
+        withdrawableAmount = (delta*uint(amountPerSec))/DECIMALS_DIVISOR;
+        owed = ((block.timestamp - lastUpdate)*uint(amountPerSec))/DECIMALS_DIVISOR;
+    }
+
+    function withdraw(address from, address to, uint216 amountPerSec) external {
+        (uint40 lastUpdate, bytes32 streamId, uint amountToTransfer) = _withdraw(from, to, amountPerSec);
+        streamToStart[streamId] = lastUpdate;
+        payers[from].lastPayerUpdate = lastUpdate;
+        token.safeTransfer(to, amountToTransfer);
+    }
+
+    function _cancelStream(address to, uint216 amountPerSec) internal returns (bytes32 streamId) {
+        uint40 lastUpdate; uint amountToTransfer;
+        (lastUpdate, streamId, amountToTransfer) = _withdraw(msg.sender, to, amountPerSec);
+        streamToStart[streamId] = 0;
+        Payer storage payer = payers[msg.sender];
+        unchecked{
+            payer.totalPaidPerSec -= amountPerSec;
+        }
+        payer.lastPayerUpdate = lastUpdate;
+        token.safeTransfer(to, amountToTransfer);
+    }
+
+    function cancelStream(address to, uint216 amountPerSec) public {
+        bytes32 streamId = _cancelStream(to, amountPerSec);
+        emit StreamCancelled(msg.sender, to, amountPerSec, streamId);
+    }
+
+    function pauseStream(address to, uint216 amountPerSec) public {
+        bytes32 streamId = _cancelStream(to, amountPerSec);
+        emit StreamPaused(msg.sender, to, amountPerSec, streamId);
+    }
+
+    function modifyStream(address oldTo, uint216 oldAmountPerSec, address to, uint216 amountPerSec) external {
+        bytes32 oldStreamId = _cancelStream(oldTo, oldAmountPerSec);
+        bytes32 newStreamId = _createStream(to, amountPerSec);
+        emit StreamModified(msg.sender, oldTo, oldAmountPerSec, oldStreamId, to, amountPerSec, newStreamId);
+    }
+
+    function deposit(uint amount) public {
+        balances[msg.sender] += amount * DECIMALS_DIVISOR;
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        emit PayerDeposit(msg.sender, amount);
+    }
+
+    function depositAndCreate(uint amountToDeposit, address to, uint216 amountPerSec) external {
+        deposit(amountToDeposit);
+        createStream(to, amountPerSec);
+    }
+
+    function depositAndCreateWithReason(uint amountToDeposit, address to, uint216 amountPerSec, string calldata reason) external {
+        deposit(amountToDeposit);
+        createStreamWithReason(to, amountPerSec, reason);
+    }
+
+    function withdrawPayer(uint amount) public {
+        Payer storage payer = payers[msg.sender];
+        balances[msg.sender] -= amount; // implicit check that balance > amount
+        uint delta = block.timestamp - payer.lastPayerUpdate;
+        unchecked {
+            require(balances[msg.sender] >= delta*uint(payer.totalPaidPerSec), ""pls no rug"");
+            uint tokenAmount = amount/DECIMALS_DIVISOR;
+            token.safeTransfer(msg.sender, tokenAmount);
+            emit PayerWithdraw(msg.sender, tokenAmount);
+        }
+    }
+
+    function withdrawPayerAll() external {
+        Payer storage payer = payers[msg.sender];
+        unchecked {
+            uint delta = block.timestamp - payer.lastPayerUpdate;
+            withdrawPayer(balances[msg.sender]-delta*uint(payer.totalPaidPerSec));
+        }
+    }
+
+    function getPayerBalance(address payerAddress) external view returns (int) {
+        Payer storage payer = payers[payerAddress];
+        int balance = int(balances[payerAddress]);
+        uint delta = block.timestamp - payer.lastPayerUpdate;
+        return (balance - int(delta*uint(payer.totalPaidPerSec)))/int(DECIMALS_DIVISOR);
+    }
+}","pragma solidity ^0.7.0;
+
+import ""../libraries/ante-v05-core/AnteTest.sol"";
+
+interface ILlamaPayFactory {
+    function getLlamaPayContractByToken(address _token) external view returns (address, bool);
+}
+
+interface ILlamaPay {
+    function payers(address _payer) external view returns (uint40, uint216);
+}
+
+contract AnteLlamaPayTest is
+    AnteTest(""LlamaPay never pays future payments early (lastPayerUpdate[anyone] <= block.timestamp)"")
+{
+   ILlamaPayFactory internal factory;
+
+    address public tokenAddress;
+    address public payerAddress;
+
+    constructor(address _llamaPayFactoryAddress) {
+        factory = ILlamaPayFactory(_llamaPayFactoryAddress);
+
+        protocolName = ""LlamaPay""; // <3
+        testedContracts.push(_llamaPayFactoryAddress);
+        testedContracts.push(address(0)); // LlamaPay instance once set
+    }
+
+    function checkTestPasses() external view override returns (bool) {
+       (address predictedAddress, bool isDeployed) = factory.getLlamaPayContractByToken(tokenAddress);
+        if (isDeployed) {
+            (uint40 lastPayerUpdate, ) = ILlamaPay(predictedAddress).payers(payerAddress);
+
+           return (lastPayerUpdate <= block.timestamp);
+        }
+
+        // If invalid LlamaPay address passed in, test will still pass
+        return true;
+    }
+
+
+    function setPayerAddress(address _payerAddress) external {
+        // Could check that valid payer mapping exists, but also, an invalid
+        // payer address doesn't fail the test so no risk of false positive.
+        payerAddress = _payerAddress;
+    }
+
+    function setTokenAddress(address _tokenAddress) external {
+        // Check that LlamaPay instance exists for the token
+        (address predictedAddress, bool isDeployed) = factory.getLlamaPayContractByToken(_tokenAddress);
+        require(isDeployed, ""ANTE: LlamaPay instance not deployed for that token"");
+        testedContracts[1] = predictedAddress;
+        tokenAddress = _tokenAddress;
+    }
+}
+
+###
+"
+"Write an Ante test that checks if MetaStreet Vault's Junior Tranche is solvent. This is the MetaStreet Vault contract used.
+
+contract Vault {
+
+    constructor() initializer {}
+
+    function initialize(
+        string memory name_,
+        IERC20 currencyToken_,
+        ILoanPriceOracle loanPriceOracle_,
+        LPToken seniorLPToken_,
+        LPToken juniorLPToken_
+    ) external initializer {
+        if (address(currencyToken_) == address(0)) revert InvalidAddress();
+        if (address(loanPriceOracle_) == address(0)) revert InvalidAddress();
+        if (address(seniorLPToken_) == address(0)) revert InvalidAddress();
+        if (address(juniorLPToken_) == address(0)) revert InvalidAddress();
+
+        if (IERC20Metadata(address(currencyToken_)).decimals() != 18) revert UnsupportedTokenDecimals();
+
+        __AccessControl_init();
+        __Pausable_init();
+        __ReentrancyGuard_init();
+
+        _name = name_;
+        _currencyToken = currencyToken_;
+        _loanPriceOracle = loanPriceOracle_;
+        _seniorLPToken = seniorLPToken_;
+        _juniorLPToken = juniorLPToken_;
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(EMERGENCY_ADMIN_ROLE, msg.sender);
+    }
+
+    function trancheState(
+        TrancheId trancheId
+    )
+        external
+        view
+        returns (
+            uint256 realizedValue,
+            uint256 estimatedValue,
+            uint256 pendingRedemptions,
+            uint256 redemptionQueue,
+            uint256 processedRedemptionQueue,
+            uint256 depositSharePrice,
+            uint256 redemptionSharePrice_
+        )
+    {
+        Tranche storage tranche = _trancheState(trancheId);
+        return (
+            tranche.realizedValue,
+            _computeEstimatedValue(trancheId),
+            tranche.pendingRedemptions,
+            tranche.redemptionQueue,
+            tranche.processedRedemptionQueue,
+            _computeSharePrice(trancheId),
+            _computeRedemptionSharePrice(trancheId)
+        );
+    }
+
+}
+
+
+","pragma solidity ^0.8.0;
+
+import ""../AnteTest.sol"";
+
+interface IVaultAbridged {
+    enum TrancheId {
+        Senior,
+        Junior
+    }
+
+    function trancheState(TrancheId trancheId)
+        external
+        view
+        returns (
+            uint256 realizedValue,
+            uint256 estimatedValue,
+            uint256 pendingRedemptions,
+            uint256 redemptionQueue,
+            uint256 processedRedemptionQueue,
+            uint256 depositSharePrice,
+            uint256 redemptionSharePrice_
+        );
+}
+
+// @title MetaStreet Vault Junior Tranche Solvency Test
+// @notice Ante Test to check if a MetaStreet Vault's junior tranche is solvent
+contract AnteMetaStreetVaultSolvencyTest is AnteTest(""Ensure that a MetaStreet Vault's Junior Tranche is solvent"") {
+    IVaultAbridged private vault;
+
+    constructor(address _vault) {
+        protocolName = ""MetaStreet"";
+        testedContracts.push(_vault);
+
+        vault = IVaultAbridged(_vault);
+    }
+
+    // @notice Check if a Vault's junior tranche is solvent
+    // @return true if Vault's junior tranche is solvent, otherwise false
+    function checkTestPasses() external view override returns (bool) {
+        (uint256 realizedValue, , uint256 pendingRedemptions, , , , ) = vault.trancheState(
+            IVaultAbridged.TrancheId.Junior
+        );
+
+        return realizedValue >= pendingRedemptions;
+    }
+}
+
+###
+"
